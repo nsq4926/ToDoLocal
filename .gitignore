@@ -1,0 +1,28 @@
+# 依赖
+node_modules/
+
+# 构建产物与打包成品（体积较大，通过 Release 分发）
+dist/
+release/
+*.asar
+*.exe
+*.zip
+*.msi
+*.blockmap
+
+# 自动化验收输出（截图副本已归档到 docs/screenshots/）
+verify-out/
+
+# 应用运行时数据
+ToDoLocal-Data/
+data.json
+
+# 本地工作区笔记（不对外公开）
+.workbuddy/
+
+# 系统与编辑器
+Thumbs.db
+.DS_Store
+*.log
+.idea/
+.vscode/

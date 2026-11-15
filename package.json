@@ -1,0 +1,61 @@
+{
+  "name": "todo-local",
+  "version": "1.1.0",
+  "description": "Microsoft To Do style offline desktop task manager, strictly local with no network access",
+  "main": "src/main.js",
+  "license": "MIT",
+  "author": "nsq4926",
+  "keywords": [
+    "electron",
+    "todo",
+    "task-manager",
+    "offline",
+    "local-first",
+    "windows"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nsq4926/ToDoLocal.git"
+  },
+  "homepage": "https://github.com/nsq4926/ToDoLocal#readme",
+  "bugs": {
+    "url": "https://github.com/nsq4926/ToDoLocal/issues"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "electron": "45.3.2",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "cn.local.todolist.app",
+    "productName": "ToDoLocal",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "asar": true,
+    "compression": "maximum",
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "dir",
+          "arch": ["x64"]
+        }
+      ]
+    }
+  }
+}
