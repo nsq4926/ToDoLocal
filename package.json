@@ -1,6 +1,6 @@
 {
   "name": "todo-local",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Microsoft To Do style offline desktop task manager, strictly local with no network access",
   "main": "src/main.js",
   "license": "MIT",
@@ -44,6 +44,10 @@
       {
         "from": "build/icon.ico",
         "to": "icon.ico"
+      },
+      {
+        "from": "build/tray.png",
+        "to": "tray.png"
       }
     ],
     "asar": true,
@@ -53,9 +57,13 @@
       "target": [
         {
           "target": "dir",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
-    }
-  }
+    },
+    "npmRebuild": false
+  },
+  "productName": "ToDoLocal"
 }

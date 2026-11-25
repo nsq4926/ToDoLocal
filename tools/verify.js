@@ -3,12 +3,17 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const zlib = require('zlib');
 const { app, BrowserWindow } = require('electron');
 
 const tmpData = path.join(os.tmpdir(), 'todo-verify-' + Date.now());
 app.setPath('userData', tmpData);
 const outDir = path.join(__dirname, '..', 'verify-out');
 fs.mkdirSync(outDir, { recursive: true });
+
+// 原生保存对话框在自动化里无法点击，这里替换为固定输出路径，用于验证 Excel 导出落盘。
+const exportTarget = path.join(tmpData, 'ToDoLocal-verify.xlsx');
+require('electron').dialog.showSaveDialog = async () => ({ canceled: false, filePath: exportTarget });
 
 require('../src/main.js');
 
@@ -36,6 +41,10 @@ async function run() {
   const win = BrowserWindow.getAllWindows()[0];
   if (!win) { check('窗口创建', false, '未找到 BrowserWindow'); return finish(); }
   const wc = win.webContents;
+  const repoRoot = path.resolve(__dirname, '..');
+  const repoRootPosix = repoRoot.replace(/\\/g, '/');
+  const wsDir = repoRootPosix + '/src';
+  const wsFile = repoRootPosix + '/README.md';
   const consoleErrors = [];
   wc.on('console-message', (...args) => {
     const text = args.map((a) => (a && typeof a === 'object' ? (a.message || JSON.stringify(a)) : String(a))).join(' ');
@@ -183,6 +192,51 @@ async function run() {
     menu.classList.add('hidden');
     return { ok };`);
 
+  await step(wc, '更多菜单：导出到 Excel 数据列', `
+    document.getElementById('btnMore').click();
+    await wait(140);
+    const menu = document.getElementById('popMenu');
+    const hasItem = !!menu.querySelector('[data-cmd="export-excel"]') && menu.textContent.includes('导出到 Excel');
+    const payload = buildExcelPayload();
+    const headers = payload.headers.map(h => h.title);
+    const base = ['是否星标（重要）', '待办标题', '步骤', '添加日期', '截至日期', '重复状态', '所属列表', '备注'];
+    const wsIndex = headers.findIndex(h => h.startsWith('工作区目录'));
+    const linked = payload.rows.filter(r => r[wsIndex] && r[wsIndex].link && r[wsIndex].link.startsWith('file:///'));
+    return { ok: hasItem && headers.length >= 9 && base.every((t, i) => headers[i] === t)
+      && wsIndex === base.length && wsIndex === headers.length - 1
+      && payload.rows.length === state.tasks.length && linked.length >= 1,
+      headers, rows: payload.rows.length, linked: linked.length, wsIndex };`);
+
+  await step(wc, '导出 Excel 写入磁盘', `
+    const r = await window.todoAPI.exportExcel(buildExcelPayload());
+    return { ok: !!(r && r.ok === true && r.path), path: r && r.path, error: r && r.error };`);
+  try {
+    const buf = fs.readFileSync(exportTarget);
+    // 解压本地头（deflate）后检查工作表 XML：表头文案、超链接与外部关系。
+    const entries = new Map();
+    let p = 0;
+    while (p + 30 <= buf.length && buf.readUInt32LE(p) === 0x04034b50) {
+      const method = buf.readUInt16LE(p + 8);
+      const compSize = buf.readUInt32LE(p + 18);
+      const nameLen = buf.readUInt16LE(p + 26);
+      const extraLen = buf.readUInt16LE(p + 28);
+      const name = buf.slice(p + 30, p + 30 + nameLen).toString('utf8');
+      const start = p + 30 + nameLen + extraLen;
+      const body = buf.slice(start, start + compSize);
+      entries.set(name, method === 8 ? zlib.inflateRawSync(body) : body);
+      p = start + compSize;
+    }
+    const sheet = entries.has('xl/worksheets/sheet1.xml') ? entries.get('xl/worksheets/sheet1.xml').toString('utf8') : '';
+    const rels = entries.has('xl/worksheets/_rels/sheet1.xml.rels') ? entries.get('xl/worksheets/_rels/sheet1.xml.rels').toString('utf8') : '';
+    check('导出 Excel 文件有效', buf[0] === 0x50 && buf[1] === 0x4b && buf.length > 1500
+      && sheet.includes('是否星标（重要）') && sheet.includes('<hyperlinks>')
+      && rels.includes('TargetMode="External"') && rels.includes('file:///'), {
+      path: exportTarget, size: buf.length, entries: [...entries.keys()].length,
+    });
+  } catch (err) {
+    check('导出 Excel 文件有效', false, String(err));
+  }
+
   await step(wc, '任务右键菜单完整项', `
     const item = document.querySelector('#taskList .task-item');
     const r = item.getBoundingClientRect();
@@ -243,16 +297,45 @@ async function run() {
   await wait(280);
   await shot(wc, '06-steps-expanded.png');
 
-  await step(wc, '详情工作文件夹与资源管理器接口', `
+  await step(wc, '详情工作区：多条目编辑区与打开接口', `
     const t = state.tasks.find(x => x.title === '自动化验证任务') || state.tasks[0];
-    updateTask(t.id, { folder: 'D:/APP/BuddyWork/ToDoList' });
+    updateTask(t.id, { workspace: [
+      { path: ${JSON.stringify(wsDir)}, kind: 'dir' },
+      { path: ${JSON.stringify(wsFile)}, kind: 'file' },
+    ] });
     selectedId = t.id; detailEditor = null; renderAll();
+    await wait(140);
+    const detail = document.getElementById('detailInner');
+    const text = detail.textContent;
+    const items = detail.querySelectorAll('#wsBox .ws-item');
+    const box = document.getElementById('wsBox');
+    const invalid = await API.openPath('Z:/__不存在的目录__');
+    const stat = await API.statPaths([${JSON.stringify(wsFile)}]);
+    return { ok: text.includes('工作区') && !text.includes('设置工作文件夹') && !detail.innerHTML.includes('data-field="workspace"')
+      && items.length === 2 && !!box && box.textContent.includes('README.md')
+      && invalid.ok === false && !!stat[0] && stat[0].kind === 'file'
+      && typeof API.pickWorkspace === 'function' && typeof API.pathForFile === 'function',
+      items: items.length, kind: stat[0] && stat[0].kind, invalidOpen: invalid.ok };`);
+  await shot(wc, '10-workspace.png');
+
+  await step(wc, '工作区空状态提示与移除条目', `
+    const t = state.tasks[0];
+    updateTask(t.id, { workspace: [] });
+    selectedId = t.id; detailEditor = null; renderAll();
+    await wait(130);
+    const box = document.getElementById('wsBox');
+    const placeholder = !!box && box.textContent.includes('点击选择文件目录或文件，可选择多项，可拖入添加');
+    updateTask(t.id, { workspace: [
+      { path: 'D:/__verify__/a.txt', kind: 'file' },
+      { path: 'D:/__verify__/b.txt', kind: 'file' },
+    ] });
+    renderAll();
     await wait(120);
-    const detailText = document.getElementById('detailInner').textContent;
-    const invalid = await API.openFolder('Z:/__不存在的目录__');
-    return { ok: detailText.includes('ToDoList') && !detailText.includes('设置工作文件夹')
-      && invalid.ok === false && typeof API.pickFolder === 'function',
-      detailHasFolder: detailText.includes('ToDoList'), invalidOpen: invalid.ok };`);
+    const del = document.querySelector('#wsBox .ws-item .ws-del');
+    if (del) del.click();
+    await wait(150);
+    return { ok: placeholder && wsItems(getTask(t.id)).length === 1,
+      placeholder, left: wsItems(getTask(t.id)).length };`);
 
   await step(wc, '切换到小面板', `
     view = 'myday'; selectedId = null; renderAll();
@@ -273,7 +356,8 @@ async function run() {
     return { ok: miniDetail === true
       && document.getElementById('miniPages').classList.contains('show-detail')
       && !document.getElementById('miniBack').classList.contains('hidden')
-      && !!document.getElementById('miniTitleInput') };`);
+      && !!document.getElementById('miniTitleInput')
+      && !!document.querySelector('#miniDetailInner [data-act="mini-ws-open"]') };`);
   await shot(wc, '05-mini-detail.png');
 
   await step(wc, '左上箭头返回并切回大面板', `
@@ -298,9 +382,10 @@ async function run() {
     const raw = fs.readFileSync(dataFile, 'utf8');
     const data = JSON.parse(raw);
     check('本地数据落盘', data.tasks.length >= 5 && data.tasks.some((t) => t.title === '自动化验证任务')
-      && 'miniMode' in data.settings && data.tasks.some((t) => 'folder' in t), {
+      && 'miniMode' in data.settings && data.tasks.some((t) => Array.isArray(t.workspace)), {
       file: dataFile, tasks: data.tasks.length, lists: data.lists.length,
       theme: data.settings.theme, miniMode: data.settings.miniMode,
+      workspace: data.tasks.filter((t) => (t.workspace || []).length).length,
     });
   } catch (err) {
     check('本地数据落盘', false, String(err));
@@ -323,6 +408,17 @@ async function run() {
     check('托盘图标资源', fs.existsSync(iconPath) && !nativeImage.createFromPath(iconPath).isEmpty(), { path: iconPath });
   } catch (err) {
     check('托盘图标资源', false, String(err));
+  }
+  // 窗口 / 任务栏图标与托盘图标必须同源，且 ICO 内含多尺寸帧（单帧 256 会被任务栏回退到 exe 图标）。
+  try {
+    const buildIco = fs.readFileSync(path.join(repoRoot, 'build', 'icon.ico'));
+    const srcIco = fs.readFileSync(iconPath);
+    const frames = buildIco.readUInt16LE(4);
+    check('窗口与托盘图标同源且多尺寸', buildIco.equals(srcIco) && frames >= 5, {
+      bytes: buildIco.length, frames,
+    });
+  } catch (err) {
+    check('窗口与托盘图标同源且多尺寸', false, String(err));
   }
   check('页面运行无报错', consoleErrors.length === 0, consoleErrors.slice(0, 5));
   finish();

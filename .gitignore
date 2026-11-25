@@ -26,3 +26,9 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+
+# 大型本地工具链与实验目录（不入库，通过 Release 分发成品）
+electron/
+tools/node-v22.12.0-win-x64/
+wpf/
+HANDOFF.md

@@ -18,11 +18,21 @@ const API = window.todoAPI || {
   },
   importData: async () => ({ ok: false }),
   notify: async (title, body) => console.log('[提醒]', title, body),
-  info: async () => ({ version: '1.1.0', dataFile: '浏览器预览模式（localStorage）', portable: false, autoStart: false }),
+  info: async () => ({ version: '1.2.0', dataFile: '浏览器预览模式（localStorage）', portable: false, autoStart: false }),
   win: () => {}, winMode: () => {}, isMaximized: async () => false, onMaximizedChange: () => {},
   onFlush: () => {}, onTrayAction: () => {},
   getAutoStart: async () => false, setAutoStart: async (v) => !!v,
   pickFolder: async () => null, openFolder: async () => ({ ok: false }),
+  pickWorkspace: async () => [],
+  statPaths: async (targets) => (Array.isArray(targets) ? targets : []).map((p) => ({
+    path: p, kind: 'file', name: String(p).split(/[\\/]/).filter(Boolean).pop() || String(p), exists: true,
+  })),
+  pathForFile: () => '',
+  openPath: async () => ({ ok: false }),
+  setPin: async () => false,
+  log: () => {},
+  openExternal: async () => false,
+  exportExcel: async () => ({ ok: false, error: '浏览器预览模式不支持导出 Excel' }),
 };
 
 /* ============================ 工具函数 ============================ */
@@ -47,6 +57,20 @@ const toLocalInput = (iso) => {
   return `${dateStr(d)}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
 const basename = (p) => String(p || '').split(/[\\/]/).filter(Boolean).pop() || '';
+const dirnameOf = (p) => {
+  const s = String(p || '').replace(/[\\/]+$/, '');
+  const i = Math.max(s.lastIndexOf('\\'), s.lastIndexOf('/'));
+  return i > 0 ? s.slice(0, i) : '';
+};
+/** 本地路径 → Excel 超链接。与 Excel 自身写法保持一致：`file:///` + 反斜杠路径，
+    只转义空格等 URL 保留字符；中文保持原样，否则 Excel 会按 ANSI 解码百分号编码，链接变成乱码打不开。 */
+const fileUrl = (p) => {
+  const raw = String(p || '').trim();
+  if (!raw) return '';
+  const encode = (s) => s.replace(/[ #?%&]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  if (/^[\\/]{2}/.test(raw)) return 'file:' + encode(raw.replace(/\\/g, '/')); // UNC：\\server\share
+  return 'file:///' + encode(raw.replace(/\//g, '\\').replace(/^\\+/, ''));
+};
 
 const COLORS = ['#2563c9', '#6a4fc0', '#b8467e', '#c4314b', '#c1622a', '#237a55', '#00838f', '#5c6470'];
 const THEMES = [
@@ -84,6 +108,8 @@ let dragId = null;
 let expandedSteps = new Set();
 let miniMode = false;
 let miniDetail = false;
+let pinned = false;
+let appElevated = false;
 let ctxTaskId = null;
 let ctxSub = null;
 let ctxXY = { x: 0, y: 0 };
@@ -107,9 +133,29 @@ function mkTask(title, extra = {}) {
   return Object.assign({
     id: uid(), title, listId: 'inbox', completed: false, completedAt: null,
     important: false, myDay: null, dueDate: null, remindAt: null, reminded: false,
-    repeat: 'none', note: '', steps: [], folder: '', createdAt: Date.now(), updatedAt: Date.now(), order: Date.now(),
+    repeat: 'none', note: '', steps: [], workspace: [], createdAt: Date.now(), updatedAt: Date.now(), order: Date.now(),
   }, extra);
 }
+
+/** 工作区条目统一为 { path, kind: 'dir' | 'file' }，并兼容旧版单目录字段 folder。 */
+function normalizeWorkspace(t) {
+  const raw = Array.isArray(t.workspace) ? t.workspace.slice() : [];
+  if (t.folder) raw.push({ path: t.folder, kind: 'dir' });
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const p = typeof item === 'string' ? item : (item && item.path);
+    if (!p) continue;
+    const key = String(p).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ path: String(p), kind: item && item.kind === 'dir' ? 'dir' : 'file' });
+  }
+  return out;
+}
+
+const wsItems = (t) => (t && Array.isArray(t.workspace) ? t.workspace : []).filter((w) => w && w.path);
+const wsKind = (w) => (w && w.kind === 'dir' ? 'dir' : 'file');
 
 function normalize(raw) {
   if (!raw || typeof raw !== 'object' || !Array.isArray(raw.tasks)) return null;
@@ -126,6 +172,8 @@ function normalize(raw) {
     const base = mkTask('');
     const o = Object.assign({}, base, t);
     o.steps = Array.isArray(t.steps) ? t.steps.map((st) => Object.assign({ id: uid(), title: '', done: false }, st)) : [];
+    o.workspace = normalizeWorkspace(t);
+    delete o.folder;
     o.order = Number.isFinite(t.order) ? t.order : 0;
     return o;
   });
@@ -228,7 +276,11 @@ function taskSubHTML(t) {
   const st = t.steps || [];
   if (st.length) parts.push(`<button class="steps-toggle" data-act="expand-steps" data-id="${t.id}" title="展开或收起步骤">${ico(expandedSteps.has(t.id) ? 'down' : 'right', 'ic ic-12')} 步骤 ${st.filter((s) => s.done).length}/${st.length}</button>`);
   if (t.note) parts.push(`<span class="ts-part">${ico('note', 'ic ic-12')} 备注</span>`);
-  if (t.folder) parts.push(`<span class="ts-part">${ico('folder', 'ic ic-12')} ${esc(basename(t.folder))}</span>`);
+  const ws = wsItems(t);
+  if (ws.length) {
+    const first = ws[0];
+    parts.push(`<span class="ts-part">${ico(wsKind(first) === 'dir' ? 'folder' : 'file', 'ic ic-12')} ${esc(basename(first.path))}${ws.length > 1 ? ` +${ws.length - 1}` : ''}</span>`);
+  }
   return parts.length ? `<div class="task-sub">${parts.join('<span class="ts-dot">·</span>')}</div>` : '';
 }
 
@@ -337,15 +389,6 @@ function renderDetail() {
     editorHTML = `<div class="d-editor"><select data-act="de-move">
       ${state.lists.map((x) => `<option value="${x.id}" ${t.listId === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
     </select></div>`;
-  } else if (detailEditor === 'folder') {
-    editorHTML = `<div class="d-editor">
-      <input type="text" id="deFolderPath" value="${esc(t.folder || '')}" placeholder="文件夹路径，例如 D:\\Work">
-      <div class="de-preset">
-        <button class="ao-chip" data-act="de-pick-folder">浏览…</button>
-        <button class="ao-chip" data-act="de-open-folder">打开</button>
-        <button class="ao-chip" data-act="de-folder-save">保存</button>
-        <button class="ao-chip" data-act="de-folder-clear">清除</button>
-      </div></div>`;
   }
 
   $('detailInner').innerHTML = `
@@ -360,11 +403,10 @@ function renderDetail() {
         </div>
         ${row('myday', 'sun', t.myDay === today() ? '已添加到我的一天' : '添加到我的一天', '', t.myDay === today())}
         ${row('due', 'calendar', t.dueDate ? '截止日期' : '添加截止日期', t.dueDate ? dueLabel(t.dueDate) : '', !!t.dueDate)}
-        ${editorHTML && ['due', 'remind', 'repeat', 'move', 'folder'].includes(detailEditor) ? `<div id="editorSlot"></div>` : ''}
+        ${editorHTML && ['due', 'remind', 'repeat', 'move'].includes(detailEditor) ? `<div id="editorSlot"></div>` : ''}
         ${row('remind', 'bell', t.remindAt ? '提醒' : '提醒我', t.remindAt ? dtLabel(t.remindAt) : '', !!t.remindAt)}
         ${row('repeat', 'repeat', '重复', t.repeat !== 'none' ? REPEATS.find((r) => r.id === t.repeat).label : '', t.repeat !== 'none')}
         ${row('move', 'move', '所属列表', l ? esc(l.name) : '', false)}
-        ${folderRowHTML(t)}
       </div>
 
       <div class="d-card">
@@ -381,6 +423,11 @@ function renderDetail() {
         <div class="d-section-title" style="padding:10px 12px 0">备注</div>
         <textarea class="d-note" id="dNote" placeholder="添加备注…" spellcheck="false">${esc(t.note)}</textarea>
       </div>
+
+      <div class="d-card">
+        <div class="d-section-title" style="padding:10px 12px 0">${wsItems(t).length ? `工作区 · ${wsItems(t).length} 项` : '设置工作区'}</div>
+        ${workspaceSectionHTML(t)}
+      </div>
     </div>
     <div class="detail-bottom"><span>创建于 ${new Date(t.createdAt).toLocaleDateString('zh-CN')}</span>
       <button class="d-delete" data-act="d-delete" title="删除任务">${ico('trash', 'ic ic-18')}</button></div>`;
@@ -389,7 +436,7 @@ function renderDetail() {
   if (editorHTML) {
     const slot = $('editorSlot');
     if (slot) {
-      const map = { due: 'due', remind: 'remind', repeat: 'repeat', move: 'move', folder: 'folder' };
+      const map = { due: 'due', remind: 'remind', repeat: 'repeat', move: 'move' };
       const rows = $('detailInner').querySelectorAll('.d-row');
       let anchor = null;
       for (const r of rows) if (r.dataset.field === map[detailEditor]) anchor = r;
@@ -453,6 +500,7 @@ function spawnRepeat(t) {
   const next = mkTask(t.title, {
     listId: t.listId, important: t.important, dueDate: dateStr(base), repeat: t.repeat,
     note: t.note, steps: (t.steps || []).map((s) => ({ id: uid(), title: s.title, done: false })),
+    workspace: wsItems(t).map((w) => ({ path: w.path, kind: w.kind })),
     order: newOrder(),
   });
   if (t.remindAt) {
@@ -564,7 +612,9 @@ function moreMenuHTML() {
     `<div class="pm-item" data-cmd="sort" data-value="${v}"><span class="pm-icon">${ico('sort', 'ic ic-16')}</span><span class="pm-label">${n}</span>${state.settings.sort === v ? `<span class="pm-check">${ico('check', 'ic ic-14')}</span>` : ''}</div>`).join('')}
     <div class="pm-sep"></div>
     ${pmItem('toggle-completed', 'eye', state.settings.showCompleted ? '隐藏已完成任务' : '显示已完成任务')}
-    ${pmItem('clear-completed', 'check-circle', '清除已完成任务')}`;
+    ${pmItem('clear-completed', 'check-circle', '清除已完成任务')}
+    <div class="pm-sep"></div>
+    ${pmItem('export-excel', 'excel', '导出到 Excel')}`;
 }
 
 function listMenuHTML(id) {
@@ -595,6 +645,19 @@ function showToast(text) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 1900);
 }
 
+/** 窗口置顶开关（大面板与迷你面板共用同一个状态）。 */
+async function togglePin() {
+  pinned = !pinned;
+  try { pinned = Boolean(await API.setPin(pinned)); } catch (_) { /* 保留本地状态 */ }
+  for (const id of ['btnPin', 'miniPin']) {
+    const btn = $(id);
+    if (!btn) continue;
+    btn.classList.toggle('on', pinned);
+    btn.title = pinned ? '取消窗口置顶' : '窗口置顶';
+  }
+  showToast(pinned ? '窗口已置顶' : '已取消置顶');
+}
+
 function showModal({ title, body, okText = '确定', onOk = null, info = false }) {
   $('modalTitle').textContent = title;
   $('modalBody').innerHTML = body;
@@ -605,6 +668,77 @@ function showModal({ title, body, okText = '确定', onOk = null, info = false }
   $('modalMask').classList.remove('hidden');
 }
 function closeModal() { $('modalMask').classList.add('hidden'); modalOkFn = null; }
+
+/* ============================ 导出到 Excel ============================ */
+const EXCEL_BASE_HEADERS = [
+  { title: '是否星标（重要）', width: 15 },
+  { title: '待办标题', width: 38 },
+  { title: '步骤', width: 42 },
+  { title: '添加日期', width: 18 },
+  { title: '截至日期', width: 13 },
+  { title: '重复状态', width: 11 },
+  { title: '所属列表', width: 14 },
+  { title: '备注', width: 42 },
+];
+
+/** 工作区（超链接）固定放在最后一列；一个任务有多个条目时向右追加列。 */
+const WS_HEADER_BASE = '工作区目录' + String.fromCharCode(92) + '文件';
+const excelWorkspaceHeader = (index) => ({
+  title: index === 0 ? WS_HEADER_BASE : `${WS_HEADER_BASE}（${index + 1}）`,
+  width: 56,
+});
+
+const excelDate = (ts) => {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${dateStr(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
+
+/** 导出全部任务：一行一个任务；工作区条目按列展开，保证每条路径都是可点击超链接。 */
+function buildExcelRows() {
+  const order = new Map(state.lists.map((l, i) => [l.id, i]));
+  const tasks = state.tasks.slice().sort((a, b) => {
+    const la = order.has(a.listId) ? order.get(a.listId) : 999;
+    const lb = order.has(b.listId) ? order.get(b.listId) : 999;
+    if (la !== lb) return la - lb;
+    return (Number(a.order) || 0) - (Number(b.order) || 0);
+  });
+
+  let maxWorkspace = 1;
+  for (const t of tasks) maxWorkspace = Math.max(maxWorkspace, wsItems(t).length);
+
+  const rows = [];
+  for (const t of tasks) {
+    const l = getList(t.listId);
+    const steps = (t.steps || []).map((s, i) => `${i + 1}. ${s.title}${s.done ? ' ✔' : ''}`).join('\n');
+    const row = [
+      { v: t.important ? '是' : '否' },
+      { v: t.title || '' },
+      { v: steps },
+      { v: excelDate(t.createdAt) },
+      { v: t.dueDate || '' },
+      { v: (REPEATS.find((r) => r.id === t.repeat) || REPEATS[0]).label },
+      { v: l ? l.name : '' },
+      { v: String(t.note || '') },
+    ];
+    const ws = wsItems(t);
+    for (let i = 0; i < maxWorkspace; i++) {
+      const item = ws[i];
+      row.push(item ? { v: item.path, link: fileUrl(item.path) } : { v: '' });
+    }
+    rows.push(row);
+  }
+  return { rows, maxWorkspace };
+}
+
+function buildExcelPayload() {
+  const { rows, maxWorkspace } = buildExcelRows();
+  const headers = EXCEL_BASE_HEADERS.concat(
+    Array.from({ length: maxWorkspace }, (_, i) => excelWorkspaceHeader(i))
+  );
+  return { sheetName: '任务清单', headers, rows };
+}
 
 /* ============================ 命令 ============================ */
 async function handleCommand(cmd, ds) {
@@ -656,7 +790,7 @@ async function handleCommand(cmd, ds) {
       const src = getTask(ds.task); if (!src) break;
       const copy = mkTask(src.title, {
         listId: v, important: src.important, dueDate: src.dueDate, remindAt: src.remindAt,
-        repeat: src.repeat, note: src.note, folder: src.folder, order: newOrder(),
+        repeat: src.repeat, note: src.note, workspace: wsItems(src).map((w) => ({ path: w.path, kind: w.kind })), order: newOrder(),
         steps: (src.steps || []).map((s) => ({ id: uid(), title: s.title, done: false })),
       });
       state.tasks.push(copy);
@@ -703,6 +837,13 @@ async function handleCommand(cmd, ds) {
       showToast(r && r.ok ? `备份已导出${r.path ? '：' + r.path : ''}` : '导出已取消');
       break;
     }
+    case 'export-excel': {
+      const r = await API.exportExcel(buildExcelPayload());
+      if (r && r.ok) showToast(`已导出 Excel${r.path ? '：' + r.path : ''}`);
+      else if (r && r.canceled) showToast('导出已取消');
+      else showToast(`导出失败：${(r && r.error) || '未知错误'}`);
+      break;
+    }
     case 'import': {
       const r = await API.importData();
       if (!r || !r.ok) break;
@@ -721,10 +862,18 @@ async function handleCommand(cmd, ds) {
       const info = await API.info();
       showModal({
         title: '关于 To Do · 本地版', info: true, okText: '关闭',
-        body: `类Microsoft To Do的离线版任务清单,无需联网。<br>数据文件:<span style="word-break:break-all">${esc(info.dataFile)}</span>`,
+        body: `类 Microsoft To Do 的离线版任务清单，无需联网。<br>
+          作者：<b>nsq4926</b><br>
+          GitHub：<a href="#" data-act="open-github" style="color:var(--accent)">github.com/nsq4926/ToDoLocal</a><br>
+          数据文件：<span style="word-break:break-all">${esc(info.dataFile)}</span>`,
       });
       break;
     }
+    case 'open-github':
+      API.openExternal('https://github.com/nsq4926/ToDoLocal').then((ok) => {
+        if (!ok) showToast('无法打开浏览器，请手动访问 github.com/nsq4926/ToDoLocal');
+      });
+      break;
     case 'clear-all':
       showModal({ title: '清空所有数据', body: '将删除全部任务与自定义列表，恢复到初始状态。此操作无法撤销。', okText: '清空', onOk: () => {
         state = defaultState(); state.tasks = []; state.lists = [{ id: 'inbox', name: '任务', color: '#2563c9', builtin: true }];
@@ -749,33 +898,31 @@ function handleAction(el, ev) {
       if (s) { s.done = !s.done; persist(); renderAll(); }
       break;
     }
-    case 'd-open-folder': {
+    case 'ws-pick-file': pickWorkspaceInto('file'); break;
+    case 'ws-pick-dir': pickWorkspaceInto('dir'); break;
+    case 'ws-open': {
+      const p = el.dataset.ws || '';
+      if (!p) break;
+      API.openPath(p).then((r) => { if (!r || !r.ok) showToast('无法打开：文件或目录不存在'); });
+      break;
+    }
+    case 'ws-remove': {
       const t = getTask(selectedId);
-      if (t && t.folder) API.openFolder(t.folder).then((r) => { if (!r || !r.ok) showToast('无法打开：文件夹不存在'); });
+      if (!t) break;
+      const p = el.dataset.ws || '';
+      updateTask(t.id, { workspace: wsItems(t).filter((w) => w.path !== p) });
+      renderAll();
+      showToast('已从工作区移除');
       break;
     }
-    case 'de-pick-folder':
-      API.pickFolder().then((p) => {
-        if (!p) return;
-        updateTask(selectedId, { folder: p });
-        detailEditor = null; renderAll(); showToast('工作文件夹已设置');
-      });
-      break;
-    case 'de-open-folder': {
-      const inp = $('deFolderPath');
+    case 'ws-clear': {
       const t = getTask(selectedId);
-      const p = (inp && inp.value.trim()) || (t && t.folder) || '';
-      if (!p) { showToast('请先设置文件夹'); break; }
-      API.openFolder(p).then((r) => { if (!r || !r.ok) showToast('无法打开该文件夹'); });
+      if (!t) break;
+      updateTask(t.id, { workspace: [] });
+      renderAll();
+      showToast('工作区已清空');
       break;
     }
-    case 'de-folder-save': {
-      const inp = $('deFolderPath');
-      updateTask(selectedId, { folder: inp ? inp.value.trim() : '' });
-      detailEditor = null; renderAll(); showToast('工作文件夹已保存');
-      break;
-    }
-    case 'de-folder-clear': updateTask(selectedId, { folder: '' }); detailEditor = null; renderAll(); break;
     case 'mini-select': selectedId = id; miniDetail = true; detailEditor = null; renderAll(); break;
     case 'mini-back': miniDetail = false; renderAll(); break;
     case 'mini-toggle': toggleTask(selectedId); break;
@@ -791,11 +938,24 @@ function handleAction(el, ev) {
       updateTask(t.id, { myDay: t.myDay === today() ? null : today() }); renderAll();
       break;
     }
-    case 'mini-folder-open': {
+    case 'mini-ws-open': {
       const t = getTask(selectedId);
       if (!t) break;
-      if (!t.folder) { showToast('请在大面板的任务详情中设置工作文件夹'); break; }
-      API.openFolder(t.folder).then((r) => { if (!r || !r.ok) showToast('无法打开：文件夹不存在'); });
+      const items = wsItems(t);
+      const target = el.dataset.ws || (items[0] && items[0].path) || '';
+      if (!target) { showToast('请先添加工作区文件或目录'); break; }
+      API.openPath(target).then((r) => { if (!r || !r.ok) showToast('无法打开：文件或目录不存在'); });
+      break;
+    }
+    case 'mini-ws-add-file': pickWorkspaceInto('file'); break;
+    case 'mini-ws-add-dir': pickWorkspaceInto('dir'); break;
+    case 'mini-ws-remove': {
+      const t = getTask(selectedId);
+      if (!t) break;
+      const p = el.dataset.ws || '';
+      updateTask(t.id, { workspace: wsItems(t).filter((w) => w.path !== p) });
+      renderAll();
+      showToast('已从工作区移除');
       break;
     }
     case 'mini-delete': deleteTask(selectedId); break;
@@ -945,6 +1105,53 @@ function bindEvents() {
     showMenu(listMenuHTML(li.dataset.list), e.clientX, e.clientY);
   });
 
+  // 工作区：文件 / 文件夹拖到工作区框（或整个详情面板）即可添加。
+  let dragSeen = false;
+  const dropZone = (node) => (node && node.closest ? node.closest('#wsBox, #detail, #miniDetailInner') : null);
+  const nodeName = (node) => (node ? (node.id || node.tagName || '') : '');
+  const dragTypes = (dt) => { try { return Array.from((dt && dt.types) || []).join(','); } catch (_) { return ''; } };
+
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => e.preventDefault());
+  document.addEventListener('dragover', (e) => {
+    const zone = dropZone(e.target);
+    if (!zone) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    zone.classList.add('drag');
+    if (!dragSeen) {
+      dragSeen = true;
+      try { API.log(`dragover zone=${nodeName(zone)} types=${dragTypes(e.dataTransfer)}`); } catch (_) { /* 诊断日志失败不影响拖放 */ }
+    }
+  });
+  document.addEventListener('dragleave', (e) => {
+    const zone = dropZone(e.target);
+    if (zone && !zone.contains(e.relatedTarget)) { zone.classList.remove('drag'); dragSeen = false; }
+  });
+  document.addEventListener('drop', async (e) => {
+    const zone = dropZone(e.target);
+    if (!zone) {
+      try { API.log(`drop ignored target=${nodeName(e.target)} types=${dragTypes(e.dataTransfer)}`); } catch (_) { /* 忽略 */ }
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    zone.classList.remove('drag');
+    dragSeen = false;
+    const taskId = selectedId;
+    let paths = [];
+    try { paths = dropPaths(e.dataTransfer); } catch (_) { paths = []; }
+    try { API.log(`drop zone=${nodeName(zone)} types=${dragTypes(e.dataTransfer)} paths=${paths.length}${paths.length ? ' first=' + paths[0] : ''}`); } catch (_) { /* 忽略 */ }
+    if (!taskId) { showToast('请先选中一个任务再拖入'); return; }
+    if (!paths.length) {
+      showToast(appElevated ? '管理员模式下无法接收拖放，请用「添加文件…」' : '无法获取拖入路径，请使用「添加文件…」');
+      return;
+    }
+    let items = [];
+    try { items = await API.statPaths(paths); } catch (_) { items = paths.map((p) => ({ path: p, kind: 'file' })); }
+    wsAdd(items, taskId);
+  });
+
   $('searchInput').addEventListener('input', (e) => {
     searchText = e.target.value;
     $('searchClear').classList.toggle('hidden', !searchText);
@@ -960,6 +1167,8 @@ function bindEvents() {
   $('addInput').addEventListener('input', (e) => $('addSubmit').classList.toggle('hidden', !e.target.value.trim()));
 
   $('btnMore').addEventListener('click', (e) => { e.stopPropagation(); menuAt($('btnMore'), moreMenuHTML()); });
+  $('btnPin').addEventListener('click', togglePin);
+  $('miniPin').addEventListener('click', togglePin);
   $('btnSettings').addEventListener('click', async (e) => { e.stopPropagation(); menuAt($('btnSettings'), await settingsMenuHTML()); });
   $('btnSuggest').addEventListener('click', () => { suggestOpen = !suggestOpen; renderHeader(); renderSuggest(); });
   $('btnCompletedToggle').addEventListener('click', () => { completedOpen = !completedOpen; renderTasks(); });
@@ -1120,7 +1329,7 @@ function bindEvents() {
   });
 }
 
-/* ============================ 卡片步骤 / 工作文件夹 / 任务右键菜单 ============================ */
+/* ============================ 卡片步骤 / 工作区 / 任务右键菜单 ============================ */
 function stepsBlockHTML(t) {
   const st = t.steps || [];
   if (!st.length || !expandedSteps.has(t.id)) return '';
@@ -1129,14 +1338,99 @@ function stepsBlockHTML(t) {
     <span class="task-step-text">${esc(s.title)}</span></div>`).join('')}</div>`;
 }
 
-function folderRowHTML(t) {
-  const name = t.folder ? basename(t.folder) : '';
-  return `<div class="d-row ${t.folder ? 'active' : ''}" data-field="folder" data-act="${t.folder ? 'd-open-folder' : 'd-edit'}">
-    <span class="dr-icon">${ico('folder', 'ic ic-18')}</span>
-    <span class="dr-label">${t.folder ? esc(name) : '设置工作文件夹'}</span>
-    <span class="dr-value">${t.folder ? '点击打开' : ''}</span>
-    ${t.folder ? `<button class="dr-edit" data-act="d-edit" data-field="folder" title="更改文件夹">${ico('note', 'ic ic-14')}</button>` : ''}
+/** 工作区区块：常驻展开（与备注一致），点击空白处选择文件，支持多选与拖入。 */
+function workspaceSectionHTML(t) {
+  const items = wsItems(t);
+  const body = items.length
+    ? items.map((w) => `<div class="ws-item" data-act="ws-open" data-ws="${esc(w.path)}" title="${esc(w.path)}">
+        <span class="ws-ico">${ico(wsKind(w) === 'dir' ? 'folder' : 'file', 'ic ic-14')}</span>
+        <span class="ws-name">${esc(basename(w.path))}</span>
+        <span class="ws-dir">${esc(dirnameOf(w.path))}</span>
+        <button class="ws-del" data-act="ws-remove" data-ws="${esc(w.path)}" title="从工作区移除">${ico('close', 'ic ic-12')}</button>
+      </div>`).join('')
+    : `<div class="ws-empty">点击选择文件目录或文件，可选择多项，可拖入添加</div>`;
+  return `<div class="ws-section">
+    <div class="ws-box ${items.length ? 'has-items' : ''}" id="wsBox" data-act="ws-pick-file" title="点击选择文件，或把文件 / 文件夹拖到这里">
+      ${body}
+    </div>
+    <div class="ws-actions">
+      <button class="ao-chip" data-act="ws-pick-file">添加文件…</button>
+      <button class="ao-chip" data-act="ws-pick-dir">添加目录…</button>
+      ${items.length ? `<button class="ao-chip" data-act="ws-clear">清空</button>` : ''}
+    </div>
+    <div class="ws-tip">${appElevated
+      ? '当前以管理员身份运行：Windows 会拦截从资源管理器拖入，请用「添加文件…」或改用普通权限启动'
+      : '支持多选与拖入；点击条目打开对应文件或目录'}</div>
   </div>`;
+}
+
+/** 追加工作区条目（去重），并保持编辑区展开；taskId 用于对话框 / 拖入异步返回后仍写回原任务。 */
+function wsAdd(items, taskId) {
+  const t = getTask(taskId || selectedId);
+  if (!t) return 0;
+  const list = wsItems(t).slice();
+  const seen = new Set(list.map((w) => String(w.path).toLowerCase()));
+  let added = 0;
+  for (const item of items || []) {
+    const p = String((item && item.path) || item || '').trim();
+    if (!p) continue;
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    list.push({ path: p, kind: wsKind(item) });
+    added++;
+  }
+  if (!added) { showToast('这些内容已在工作区中'); return 0; }
+  updateTask(t.id, { workspace: list });
+  renderAll();
+  showToast(`已添加 ${added} 项到工作区`);
+  return added;
+}
+
+async function pickWorkspaceInto(mode) {
+  const taskId = selectedId;
+  if (!getTask(taskId)) return;
+  let paths = [];
+  try { paths = (await API.pickWorkspace(mode)) || []; } catch (_) { paths = []; }
+  if (!paths.length) return;
+  let items = [];
+  try { items = await API.statPaths(paths); } catch (_) { items = paths.map((p) => ({ path: p, kind: mode === 'dir' ? 'dir' : 'file' })); }
+  wsAdd(items, taskId);
+}
+
+/** 从拖放数据里取本地路径：优先 File.path / webUtils，最后回退到 text/uri-list（资源管理器一定会给）。 */
+function dropPaths(dt) {
+  const out = [];
+  const push = (p) => {
+    const s = String(p || '').trim();
+    if (s && !out.some((x) => x.toLowerCase() === s.toLowerCase())) out.push(s);
+  };
+  if (!dt) return out;
+
+  for (const f of Array.from(dt.files || [])) {
+    if (f.path) { push(f.path); continue; }
+    try { const p = API.pathForFile(f); if (p) push(p); } catch (_) { /* 继续尝试其他来源 */ }
+  }
+
+  if (!out.length) {
+    for (const type of ['text/uri-list', 'text/plain']) {
+      let raw = '';
+      try { raw = dt.getData(type) || ''; } catch (_) { continue; }
+      for (const line of raw.split(/\r?\n/)) {
+        const s = line.trim();
+        if (!s || s.startsWith('#')) continue;
+        if (/^file:/i.test(s)) {
+          let p = s.replace(/^file:\/\//i, '');
+          if (/^\/[a-zA-Z]:/.test(p)) p = p.slice(1);
+          try { p = decodeURIComponent(p); } catch (_) { /* 保留原样 */ }
+          push(p.replace(/\//g, '\\'));
+        } else if (/^[a-zA-Z]:[\\/]/.test(s) || s.startsWith('\\\\')) {
+          push(s);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 function taskMenuHTML(id) {
@@ -1206,6 +1500,7 @@ function renderMiniDetail() {
   if (!t) return '<div class="mini-empty">任务已不存在</div>';
   const l = getList(t.listId);
   const steps = t.steps || [];
+  const ws = wsItems(t);
   const meta = [];
   if (l) meta.push(l.name);
   if (t.dueDate) meta.push(dueLabel(t.dueDate) + '到期');
@@ -1218,8 +1513,21 @@ function renderMiniDetail() {
         <button class="task-star ${t.important ? 'on' : ''}" data-act="mini-star" title="重要">${ico(t.important ? 'star-fill' : 'star', 'ic ic-18')}</button>
       </div>
       <div class="mini-d-row" data-act="mini-myday"><span class="dr-icon">${ico('sun', 'ic ic-16')}</span><span class="dr-label">${t.myDay === today() ? '已在我的一天' : '添加到我的一天'}</span></div>
-      <div class="mini-d-row" data-act="mini-folder-open"><span class="dr-icon">${ico('folder', 'ic ic-16')}</span><span class="dr-label">${t.folder ? esc(basename(t.folder)) : '未设置工作文件夹'}</span><span class="dr-value">${t.folder ? '打开' : ''}</span></div>
       <div class="mini-d-row" style="cursor:default"><span class="dr-icon">${ico('calendar', 'ic ic-16')}</span><span class="dr-label">${t.dueDate ? dueLabel(t.dueDate) + '到期' : '无截止日期'}</span></div>
+    </div>
+    <div class="mini-d-card">
+      <div class="mini-d-label">工作区 · ${ws.length} 项</div>
+      ${ws.length
+        ? ws.map((w) => `<div class="mini-d-row" data-act="mini-ws-open" data-ws="${esc(w.path)}" title="${esc(w.path)}">
+            <span class="dr-icon">${ico(wsKind(w) === 'dir' ? 'folder' : 'file', 'ic ic-16')}</span>
+            <span class="dr-label">${esc(basename(w.path))}</span>
+            <button class="ws-del" data-act="mini-ws-remove" data-ws="${esc(w.path)}" title="从工作区移除">${ico('close', 'ic ic-12')}</button>
+          </div>`).join('')
+        : '<div class="mini-d-row" style="cursor:default"><span class="dr-label">未设置工作区</span></div>'}
+      <div class="mini-ws-actions">
+        <button class="ao-chip" data-act="mini-ws-add-file">添加文件…</button>
+        <button class="ao-chip" data-act="mini-ws-add-dir">添加目录…</button>
+      </div>
     </div>
     <div class="mini-d-card">
       <div class="mini-d-label">步骤 · ${steps.filter((s) => s.done).length}/${steps.length}</div>
@@ -1307,6 +1615,14 @@ async function boot() {
   applyMiniMode();
   bindEvents();
   renderAll();
+  // 提权检测会起一个同步子进程，放到界面显示之后再探测，避免拖慢冷启动。
+  setTimeout(async () => {
+    try {
+      const info = await API.info();
+      const elevated = !!(info && info.elevated);
+      if (elevated !== appElevated) { appElevated = elevated; renderAll(); }
+    } catch (_) { /* 探测失败按非提权处理 */ }
+  }, 1200);
   API.winMode(miniMode ? 'mini' : 'large');
   try { await API.save(state); } catch (_) { /* 只读环境下忽略 */ }
   API.isMaximized().then((m) => {
